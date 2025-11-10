@@ -9,3 +9,6 @@ reports/
 *.json
 *.jsonl
 logs.txt
+
+# os
+.DS_Store
