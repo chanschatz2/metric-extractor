@@ -90,25 +90,11 @@ TARGETS = [
     (35, "Average lifespan of product or warranty provided [years]")
 ]
 
-
-## To assist and automate conversions
-#UNIT_MAP: Dict[int, Tuple[str, Dict[str, float]]] = {
-#    20: ("MWh",   {"MWh": 1.0, "GWh": 1000.0, "kWh": 0.001, "MWh/yr": 1.0, "MWh/year": 1.0}),
-#    23: ("tCO2e", {"tCO2e": 1.0, "ktCO2e": 1000.0, "MtCO2e": 1_000_000.0, "tonnes CO2e": 1.0}),
-#    4:  ("m3",    {"m3": 1.0, "m^3": 1.0, "Mm3": 1_000_000.0, "cubic meters": 1.0}),
-#}
-
 # Scale conversion
 SCALE_MAP = {
     "thousand": 1_000,
     "million": 1_000_000,
     "billion": 1_000_000_000,
-    #"k": 1_000,
-    #"kt": 1_000,    # kiloton
-    #"m": 1_000_000, # million
-    #"mt": 1_000_000,    # megaton
-    #"gwh": 1_000,   # GWh -> MWh
-    #"twh": 1_000_000    # TWh -> MWh
 }
 
 # For metric variant creation
@@ -393,23 +379,6 @@ def metric_schema() -> Dict[str, Any]:
         "required": ["metric_id", "metric_name", "value", "unit", "reported_year"]
     }
 
-#JSON_EXTRACT_RE = re.compile(r'\{.*\}', re.DOTALL)
-
-#def extract_first_json(text: str) -> Dict[str, Any]:
-#    m = JSON_EXTRACT_RE.search(text)
-#    if not m:
-#        return {}
-#    frag = m.group(0)
-#    try:
-#        return json.loads(frag)
-#    except Exception:
-#        # Try to repair common trailing commas or quotes issues
-#        try:
-#            frag2 = frag.replace('\n', ' ').replace(', }', ' }').replace(', ]', ' ]')
-#            return json.loads(frag2)
-#        except Exception:
-#            return {}
-
 def extract_last_json(text: str):
     """Return the last valid top-level JSON object in text, or {}."""
     # Strip think tags that sometimes appear
@@ -447,21 +416,6 @@ def enforce_schema(obj: Dict[str, Any]) -> Dict[str, Any]:
 # Unit normalization
 # 
 
-# Convert units using UNIT_MAP
-#def normalize(metric_id: int, value: float, unit: str) -> Tuple[float, str]:
-#    if unit is None:
-#        return value, unit
-#    target = UNIT_MAP.get(metric_id)
-#    if not target:
-#        return value, unit
-#    canon_unit, conv = target
-#    u = unit.strip()
-#    if u in conv:
-#        return value * conv[u], canon_unit
-#    for alt, factor in conv.items():
-#        if u.lower() == alt.lower():
-#            return value * factor, canon_unit
-#    return value, unit
     
 def normalize(value, unit):
     # Convert scale words and metric prefixes into base units
@@ -644,29 +598,16 @@ def verify_metric(model: LocalQwen, prediction: dict, chunk_text: str, metric_na
 
 def test_values(pdf_path: str, predictions: List[Dict[str, Any]]):
     file_name = os.path.basename(pdf_path) # get just the filename from pat
-    #print("pred:")
-    #print(predictions)
     
     true = []
     for true_json in TRUE_METRICS.get(file_name):
         if true_json["metric_id"] in EXTRACT_METRICS:
             true.append(true_json)
 
-
-    #print("true:")
-    #print(true)
-
     results = []
     correct = 0
 
     for i, p_json in enumerate(predictions): # should be in same order as true since same grouping
-        #print("Prediction JSON:")
-        #print(p_json)
-        #curr_id = p_json["metric_id"]
-        #print("curr_id:")
-        #print(curr_id)
-
-        #print(f"i: {i}")
         t_value = true[i]["value"]
         if t_value == "null" or isinstance(t_value, str):
             t_value = None
@@ -771,8 +712,6 @@ def main():
             "metric_name": metric_name,
             "value": value_norm,
             "unit": unit,
-#            "value_norm": value_norm,
-#            "unit_norm": unit_norm,
             "reported_year": target_year,
             "latency_s": round(dt, 3),
             "chunks_used": ctx_chunks,
@@ -783,8 +722,6 @@ def main():
             "metric": metric_name,
             "value": value,
             "unit": unit,
-#            "value_norm": value_norm,
-#            "unit_norm": unit_norm,
             "reported_year": target_year,
             "latency_s": row["latency_s"],
         }, ensure_ascii=False))
