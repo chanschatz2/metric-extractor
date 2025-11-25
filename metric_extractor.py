@@ -5,6 +5,7 @@ import time
 import argparse
 from dataclasses import dataclass
 from typing import List, Dict, Any
+import math
 
 import numpy as np
 import pdfplumber
@@ -31,7 +32,7 @@ EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 # The metrics (by id) for this LLM to extract, by grouping
 METRICS_GROUP = {
-    "Custom": [1, 2, 3, 4, 18],
+    "Custom": [1, 2, 4, 5, 18],
     "All": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35],
     "Energy&Utilities" : [1,2,3,4,5,6,7,18,19,23,24,25,27,28,29,30,31,32],
     "Manufacturing" : [1,2,3,4,5,6,7,9,11,13,15,20,21,23,24,25,27,28,29,30,33],
@@ -41,7 +42,8 @@ METRICS_GROUP = {
 
 # SELECT PRESET GROUP
 try:
-    EXTRACT_METRICS = METRICS_GROUP["Custom"]
+    #EXTRACT_METRICS = METRICS_GROUP["Custom"]
+    EXTRACT_METRICS = METRICS_GROUP["Energy&Utilities"]
 except KeyError:
     print("ERROR: CHOSEN METRIC GROUP NOT FOUND.")
 
@@ -257,6 +259,30 @@ def proximity_score(text: str, target_year: int) -> int:
     score -= max(0, len(set(years)) - 2)
     return score
 
+# Rank chunks based on their likelihood to contain the metic:
+    # overlap with metric name, presence of numbers/units, table-like patterns
+def semantic_score(metric_name: str, text: str) -> float:
+    tl = text.lower()
+    name_tokens = [t for t in re.split(r'[\W_]+', metric_name.lower()) if t]
+    score = 0.0
+
+    # token overlap
+    for tok in name_tokens:
+        if tok and tok in tl:
+            score += 1.0
+
+    # numeric / unit cues
+    if re.search(r'\d', tl):
+        score += 0.5
+    if any(u in tl for u in ['ton', 'mwh', 'ghg', 'co2', '%', 'percent', 'm3', 'tco2e', 'usd', '$']):
+        score += 0.5
+
+    # table-ish (number followed by text)
+    if re.search(r'\d+\s+[A-Za-z]', tl):
+        score += 0.3
+
+    return score
+
 
 # Run query variants through FAISS vector DB and retrive their most relevant PDF chunks
 # De-duplicate them, then only keep the top total_cap chunks (TOP_K)
@@ -270,8 +296,13 @@ def retrieve_context(ret: Retriever, metric_name: str, target_year: int, per_que
         if c not in seen:
             stitched.append(c); seen.add(c)
 
-    # sort by year proximity
+    # sort by (year proximity, semantic similarity to the metric)
+    #stitched.sort(
+    #    key=lambda t: (proximity_score(t, target_year), semantic_score(metric_name, t)),
+    #    reverse=True
+    #)
     stitched.sort(key=lambda t: proximity_score(t, target_year), reverse=True)
+
     return stitched[:total_cap]
 
 # 
@@ -366,17 +397,18 @@ class LocalQwen:
 # JSON Schema & parsing helpers
 # 
 
+# json schema enforced by various parts of the program
 def metric_schema() -> Dict[str, Any]:
     return {
         "type": "object",
         "properties": {
             "metric_id": {"type": "integer"},
             "metric_name": {"type": "string"},
-            "value": {"type": "number"},
-            "unit": {"type": "string"},
-            "reported_year": {"type": "integer"},
+            "value": {"type": ["number", "null"]},
+            "unit": {"type": ["string", "null"]},
+            "reported_year": {"type": ["integer", "null"]},
         },
-        "required": ["metric_id", "metric_name", "value", "unit", "reported_year"]
+        "required": ["value", "unit", "reported_year"]
     }
 
 def extract_last_json(text: str):
@@ -407,16 +439,33 @@ def extract_last_json(text: str):
 
 def enforce_schema(obj: Dict[str, Any]) -> Dict[str, Any]:
     try:
+        # If this passes, we trust the object as-is
         validate(instance=obj, schema=metric_schema())
         return obj
     except Exception as e:
-        print(f"VALIDATION ERROR: {e}")
-        return {"metric_id": "", "value": 0, "unit": "", "reported_year": 0}
-    
+        print("VALIDATION ERROR:", e)
+
+        # use .get to protect from weird input
+        metric_id = obj.get("metric_id")
+        metric_name = obj.get("metric_name")
+        value = obj.get("value")
+        unit = obj.get("unit")
+        reported_year = obj.get("reported_year")
+
+        out = {
+            "metric_id": metric_id,
+            "metric_name": metric_name,
+            "value": None if value is None else value,
+            "unit": None if unit is None else unit,
+            "reported_year": None if reported_year is None else reported_year,
+            "status": "parse_error",
+            "reason": f"schema_validation_failed: {e}",
+        }
+        return out
 # Unit normalization
 # 
 
-    
+
 def normalize(value, unit):
     # Convert scale words and metric prefixes into base units
     if value is None or int(value) == 0:
@@ -444,84 +493,66 @@ def normalize(value, unit):
 #"If the requested year {target_year} is not explicitly present, return an empty JSON object."
 
 def build_user_prompt(metric_id: int, metric_name: str, context: str, target_year: int) -> str:
-    return f"""Requested metric: {metric_name}
-Target year: {target_year}
+    safe_context = context.replace("```", "'") # make sure string doesnt break
+    return f"""
+You are a sustainability metric extraction model.
 
 TASK
-Return exactly one JSON object for the requested metric using ONLY values explicitly shown in the context.
+- Find the value of the metric "{metric_name}" (id={metric_id}) for reporting year {target_year} in the CONTEXT below.
+- Use ONLY information explicitly written in CONTEXT. Do NOT infer, estimate, or compute values.
 
-SELECTION RULE:
-- Look only for the requested metric in the provided context.
-- If it is explicitly reported for multiple years, pick the value from the latest year among the target year {target_year} or the previous year {target_year - 1}.
-- Do not choose a year just because it appears later in the text—use only the year(s) where the metric’s value is actually given.
-- Record that year in reported_year.
-- If no numeric value for this metric is explicitly shown for year {target_year} or {target_year-1}, return {{}}.
+RULES
+- If the metric and the value for year {target_year} are clearly shown, copy the numeric value exactly (keep decimal point, ignore thousand separators like "," or spaces).
+- If multiple years are shown, use the row/column for year {target_year} only.
+- If the metric appears but the year {target_year} is missing, return null for value and reported_year.
+- If you cannot confidently find this metric for year {target_year}, return null for value and reported_year.
+- Never invent values. When in doubt, choose null.
 
+OUTPUT FORMAT (strict JSON)
+Return EXACTLY one JSON object with keys:
 
-CONSTRAINTS
-- Prefer table cells over narrative sentences.
-- Ignore targets/future years (> {target_year}), baselines, and YTD/quarterly figures.
-- Output numbers as plain digits (no commas). Do not guess or compute.
-
-OUTPUT
-Return ONLY one JSON object on a single line with these keys:
 {{
   "metric_id": {metric_id},
   "metric_name": "{metric_name}",
-  "value": <number>,
-  "unit": "<unit string>",
-  "reported_year": <integer>
+  "value": <number or null>,
+  "unit": <string or null>,
+  "reported_year": <integer or null>
 }}
 
-Example (no value available)
-Context:
-Metric | 2021 | 2022
-Water withdrawal [m3] | — | —
-Target year: 2024
-Expected: {{}}
-
-Context:
-{context}
-
-Return ONLY the JSON object. No explanations, no extra text.
+CONTEXT
+{safe_context}
 """
 
-def build_verifier_prompt(prediction: str, chunk: str, metric_name: str, metric_value, target_year: int) -> str:
+
+def build_verifier_prompt(chunk: str, metric_name: str, metric_value, reported_year: int, target_year: int) -> str:
+    safe_chunk = chunk.replace("```", "'") # ensure string doesnt break
     return f"""
-Requested metric:
-- Name: {metric_name}
-- Value: {str(metric_value)}
+You are verifying an ESG metric using a single text chunk.
+
+CANDIDATE
+- metric_name: {metric_name}
+- value: {metric_value}
 
 TASK
-Return exactly one JSON object with your answer to verifying whether an extracted metric value is supported by the given context.
+Decide if this candidate is DIRECTLY SUPPORTED by the CHUNK below.
+Carefully scan the CHUNK for all numeric values.
 
-VERIFICATION RULES:
-- Assume the metric is unsupported unless the context explicitly supports this metric.
-- Do not look for specific word matches, instead use the *meaning* of the requested metric.
-- Confirm ONLY if the context contains information that successfully answers the requested metric. Synonyms are OKAY.
-- Differences in units are expected and acceptable.
+"Directly supported" means ALL of the following are true:
+1. The numeric value appears in the chunk (ignoring thousand separators like "," or spaces).
+2. The chunk is describing the SAME quantity as metric_name (not employees, revenue, capacity, etc.).
 
-Context chunk:
-{chunk}
+If any of these conditions is missing, unclear or ambiguous, you MUST treat the metric as NOT supported.
 
-OUTPUT:
-Return only one JSON object:
+OUTPUT FORMAT (strict JSON)
+Return EXACTLY one JSON object:
+
 {{
-  "verified": true/false,
-  "reason": "<brief reason>"
+  "verified": true or false,
+  "reason": "<short explanation>"
 }}
 
-Return ONLY the JSON object. No explanations, no extra text.
-"""
-
-"""
-- Deny if the context could support similar, but different *meaning* metrics.
-
-
-Examples:
-- If context says "Amount of hazardous waste manifested for disposal (tons): 11.6" and metric is "Waste generated - Hazardous [metric ton]" -> verified: true
-- If context says "non-hazardous waste generated: 50 metric tons" but metric is "Waste generated - Hazardous [metric ton]" -> verified: false
-- If no value appears for the requested metric -> verified: false
+CHUNK
+{safe_chunk}
 """
 
 
@@ -543,19 +574,45 @@ def extract_metric(model: LocalQwen, metric_id: int, metric_name: str, ctx_chunk
     # obj = extract_first_json(raw)
     obj = extract_last_json(raw)
     obj = enforce_schema(obj)
+
+    # avoid not passing checks later bc of metric_id metric_name
+    obj.setdefault("metric_id", metric_id)
+    obj.setdefault("metric_name", metric_name)
+
     print("-- PASS 1: EXTRACTED METRIC --")
     print(obj)
     return obj
 
-def chunk_contains_value(chunk: str, metric_value: str) -> bool:
-    if metric_value is None:
-        return False
-    
-    # remove commas and spaces
-    chunk_norm = chunk.replace(",", "").replace("\u00A0", " ").replace("\u202F", " ").replace(" ", "")
-    val_norm = metric_value.strip().replace(",", "").replace(" ", "")
+def chunk_contains_value(chunk: str, v_str: str) -> bool:
+    rel_tol = 1e-6
+    abs_tol = 1e-6
+    # v_str -> metric value
 
-    return val_norm in chunk_norm
+    if v_str is None:
+        return False
+
+    # Parse target value
+    try:
+        target = float(str(v_str))
+    except ValueError:
+        return False
+
+    # Extract all numeric-looking substrings from chunk
+    pattern = r"-?\d[\d,]*(?:\.\d+)?"
+    nums = re.findall(pattern, chunk)
+    if not nums:
+        return False
+
+    for n in nums:
+        try:
+            val = float(n.replace(",", ""))
+        except ValueError:
+            continue
+        # numeric comparison with tolerance
+        if math.isclose(val, target, rel_tol=rel_tol, abs_tol=abs_tol):
+            return True
+
+    return False
 
 def find_chunks_with_value(chunks: list[str], metric_value: str) -> list[str]:
     if not chunks:
@@ -575,68 +632,212 @@ def verify_metric(model: LocalQwen, prediction: dict, chunk_text: str, metric_na
 
     system = "You are a strict verifier that only outputs a single compact JSON object. No explanations."
     metric_value = prediction.get("value")
-    str_json = json.dumps(prediction, ensure_ascii=False)
-    user = build_verifier_prompt(str_json, chunk_text, metric_name, metric_value, target_year)
+    reported_year = prediction.get("reported_year")
 
-    raw = "{" + model.chat(system=system, user=user)
+    user = build_verifier_prompt(
+        chunk=chunk_text,
+        metric_name=metric_name,
+        metric_value=metric_value,
+        reported_year=reported_year,
+        target_year=target_year,
+    )
+
+    raw = model.chat(system=system, user=user)
     print("-- PASS 2: CONTEXT --")
     print(chunk_text)
     print("-- PASS 2 VERIFY RAW --")
     print(raw)
 
+    # Extract the last JSON object from the raw string
     j = extract_last_json(raw) or {}
-    #print(f"j: {j}")
-    verdict = j.get("verified", "false") # if key not present, false
-    reason  = j.get("reason", "")
+    raw_verdict = j.get("verified", False)
 
-    return (verdict), (reason or "no_reason")
+    # Coerce to proper bool
+    if isinstance(raw_verdict, str):
+        verdict = raw_verdict.strip().lower() == "true"
+    else:
+        verdict = bool(raw_verdict)
+
+    reason = j.get("reason") or "no_reason"
+
+    return verdict, reason
 
 
 #
 # Testing
 #
 
-def test_values(pdf_path: str, predictions: List[Dict[str, Any]]):
-    file_name = os.path.basename(pdf_path) # get just the filename from pat
-    
-    true = []
-    for true_json in TRUE_METRICS.get(file_name):
-        if true_json["metric_id"] in EXTRACT_METRICS:
-            true.append(true_json)
+def test_values(pdf_path: str, predictions: List[Dict[str, Any]]) -> None:
+    file_name = os.path.basename(pdf_path)
+    true_metrics = TRUE_METRICS.get(file_name, [])
 
-    results = []
-    correct = 0
+    if not true_metrics:
+        print(f"[TEST] No ground-truth metrics found for {file_name}")
+        return
 
-    for i, p_json in enumerate(predictions): # should be in same order as true since same grouping
-        t_value = true[i]["value"]
-        if t_value == "null" or isinstance(t_value, str):
-            t_value = None
+    # Only evaluate metrics you asked the pipeline to extract
+    true_by_id: Dict[int, Dict[str, Any]] = {
+        m["metric_id"]: m
+        for m in true_metrics
+        if m["metric_id"] in EXTRACT_METRICS
+    }
 
-        print(f"True value: {t_value}")
+    pred_by_id: Dict[int, Dict[str, Any]] = {
+        p["metric_id"]: p for p in predictions
+    }
 
-        p_value = p_json["value"]
-        if p_value == "null":
-            p_value = None
+    n = len(true_by_id)
+    if n == 0:
+        print(f"[TEST] No overlapping metric_ids between TRUE_METRICS and EXTRACT_METRICS for {file_name}")
+        return
 
-        print(f"Predicted value: {p_value}")
+    retrieval_hits = 0           # TRUE value appears in any chunks_used
+    llm_exact = 0                # predicted value == TRUE value (normalized, year-aware)
+    llm_exact_given_retrieval = 0
 
-        if t_value == p_value:
-            if t_value == None:
-                results.append("Correct - None")
-            elif t_value != None:
-                results.append("Correct - Match")
-            else:
-                results.append("Correct")
-            correct = correct + 1
+    task_correct = 0             # your 4/5 notion: 1 correct extraction + 3 correct denials
+    value_cases = 0              # how many metrics have a non-None true value
+    value_correct = 0
+
+    print("\n=== PER-METRIC EVAL (retrieval vs extraction) ===")
+    for mid, t in sorted(true_by_id.items()):
+        gt_val = t.get("value")
+        gt_year = t.get("year")
+        gt_unit = t.get("unit")
+
+        p = pred_by_id.get(mid)
+        if not p:
+            print(f"[id={mid}] no prediction produced by pipeline")
+            continue
+
+        pred_val = p.get("value")
+        pred_year = p.get("reported_year")
+        pred_unit = p.get("unit")
+        status = p.get("status")
+        chunks_used = p.get("chunks_used") or []
+
+        # --- 1) Retrieval recall: does ANY chunk_used contain the TRUE value? ---
+        retrieval_hit = False
+        if gt_val is not None:
+            v_str = str(gt_val)
+            for ch in chunks_used:
+                if chunk_contains_value(v_str=v_str, chunk=ch):
+                    retrieval_hit = True
+                    break
+
+        if retrieval_hit:
+            retrieval_hits += 1
+
+        # --- 2) LLM extraction accuracy (numeric + year) ---
+        year_match = (gt_year is None) or (gt_year == pred_year)
+
+        numeric_match = False
+        if gt_val is not None and pred_val is not None:
+            try:
+                numeric_match = math.isclose(float(pred_val), float(gt_val), rel_tol=1e-6, abs_tol=1e-6)
+            except ValueError:
+                numeric_match = False
+
+        exact_match = numeric_match and year_match
+
+        if gt_val is not None:
+            value_cases += 1
+            if exact_match:
+                value_correct += 1
+
+        if exact_match:
+            llm_exact += 1
+            if retrieval_hit:
+                llm_exact_given_retrieval += 1
+
+        # --- 3) Task-level correctness (your 4/5 notion) ---
+        # If TRUE value exists: correct if we got the right number (regardless of status).
+        # If TRUE value is None: correct if we did NOT "accept" a value.
+        #
+        # Here, "accepting" a value means status == "accepted" AND pred_val is not None.
+        accepted = (status == "accepted" and pred_val is not None)
+
+        if gt_val is None:
+            # desired behavior: do NOT accept when the metric truly doesn't exist
+            this_correct = not accepted
         else:
-            if t_value is not None:
-                results.append("Incorrect - True Non-None")
-            else:
-                results.append("Incorrect")
-        
-    print("-- TESTING RESULTS --")
-    print(f"Results: {results}")
-    print(f"Accuracy: {correct / len(predictions)}")
+            # desired behavior: get the right value (even if status is unverified)
+            this_correct = exact_match
+
+        if this_correct:
+            task_correct += 1
+
+        print(
+            f"[id={mid}] "
+            f"true=({gt_val}, {gt_unit}, {gt_year}) "
+            f"pred=({pred_val}, {pred_unit}, {pred_year}) "
+            f"retrieval_hit={retrieval_hit} "
+            f"llm_exact={exact_match} "
+            f"accepted={accepted} "
+            f"task_correct={this_correct} "
+            f"status={status} "
+            f"reason={p.get('reason')}"
+        )
+
+    print("\n=== SUMMARY ===")
+    print(f"Total metrics evaluated: {n}")
+
+    # Retrieval recall: only over metrics that actually have a TRUE numeric value
+    if value_cases:
+        print(
+            "Retrieval recall "
+            "(TRUE value appears in any chunks_used, for metrics with TRUE numeric value): "
+            f"{retrieval_hits}/{value_cases} = {retrieval_hits / value_cases:.2f}"
+        )
+    else:
+        print(
+            "Retrieval recall "
+            "(TRUE value appears in any chunks_used): N/A (no metrics with TRUE numeric value)"
+        )
+
+    # LLM exact-match accuracy: also only over metrics with TRUE numeric value
+    if value_cases:
+        print(
+            "LLM exact-match accuracy "
+            "(normalized value + year, for metrics with TRUE numeric value): "
+            f"{llm_exact}/{value_cases} = {llm_exact / value_cases:.2f}"
+        )
+    else:
+        print(
+            "LLM exact-match accuracy "
+            "(normalized value + year): N/A (no metrics with TRUE numeric value)"
+        )
+
+    # Conditional accuracy given retrieval
+    if retrieval_hits:
+        print(
+            "LLM accuracy GIVEN retrieval_hit: "
+            f"{llm_exact_given_retrieval}/{retrieval_hits} = "
+            f"{llm_exact_given_retrieval / retrieval_hits:.2f}"
+        )
+    else:
+        print(
+            "LLM accuracy GIVEN retrieval_hit: N/A "
+            "(no cases where TRUE value appeared in chunks_used)"
+        )
+
+    # This one you already had, but we keep it for clarity
+    if value_cases:
+        print(
+            f"\nValue accuracy on metrics with a TRUE numeric value: "
+            f"{value_correct}/{value_cases} = {value_correct / value_cases:.2f}"
+        )
+    else:
+        print(
+            "\nValue accuracy on metrics with a TRUE numeric value: "
+            "N/A (no metrics with TRUE numeric value)"
+        )
+
+    print(
+        "Overall TASK-LEVEL accuracy "
+        "(correct value when TRUE exists, correct denial when TRUE is None): "
+        f"{task_correct}/{n} = {task_correct / n:.2f}"
+    )
 
 
 # 
@@ -682,23 +883,62 @@ def main():
         # extract prediction json
         out = extract_metric(qwen, metric_id, metric_name, ctx_chunks, target_year) or {}
 
+        # If Pass 1 failed to produce a valid JSON metric, skip verification
+        if out.get("status") == "parse_error" and out.get("value") is None:
+            print(f"[SKIP VERIFY] parse_error for metric {metric_id} - {metric_name}")
+            # You still want to record this attempt
+            row = {
+                "metric_id": metric_id,
+                "metric_name": metric_name,
+                "value": None,
+                "unit": None,
+                "reported_year": target_year,
+                "latency_s": round(dt, 3),
+                "chunks_used": ctx_chunks,
+                "status": out.get("status"),
+                "reason": out.get("reason"),
+                "confidence": None,
+                "citation": None,
+            }
+            results.append(row)
+            continue  # move on to the next metric
+
+
         # find chunks that contain the metric
         best_chunks = find_chunks_with_value(ctx_chunks, str(out["value"]))
         print("-- BEST CHUNKS (verifying with these) --")
         print(best_chunks)
 
         # verify with second qweb call
-        verdict, why = verify_metric(qwen, out, best_chunks, metric_name, target_year)
+        hits = len(best_chunks)
+        out["confidence"] = round(min(1.0, 0.4 + 0.2 * hits), 2)
+
+        verdict = False
+        why = "not_supported_by_context"
+        supporting_chunk = None
+
+        if best_chunks:
+            for chk in best_chunks[:3]:  # try up to 3 strongest literal matches
+                v, w = verify_metric(qwen, out, chk, metric_name, target_year)
+                if v:
+                    verdict, why = True, "supported_and_verified"
+                    supporting_chunk = chk
+                    break
+        else:
+            # no literal match in context → immediate rejection
+            verdict, why = False, "not_supported_by_context"
+
         print(f"Verdict: {verdict}")
 
-        # If not found
         if not verdict:
-            print(f"Rejecting prediction value: {out.get('value')} for {metric_name}")
+            print(f"Verification failed for value: {out.get('value')} for {metric_name}")
             print(f"     - reason: {why}")
-            out["value"] = None
-            out["unit"] = None
-            out["reported_year"] = None
-        
+            # DO NOT wipe the value; just mark it as unverified
+            out["status"] = "unverified"
+            out["reason"] = why
+        else:
+            out["status"] = "accepted"
+            out["reason"] = why
         dt = time.time() - t0 # time for both queries
 
         value = out.get("value")
@@ -715,6 +955,9 @@ def main():
             "reported_year": target_year,
             "latency_s": round(dt, 3),
             "chunks_used": ctx_chunks,
+            "status": out.get("status"),
+            "reason": out.get("reason"),
+            "confidence": out.get("confidence")
         }
         results.append(row)
 
@@ -724,6 +967,10 @@ def main():
             "unit": unit,
             "reported_year": target_year,
             "latency_s": row["latency_s"],
+            "chunks_used": ctx_chunks,
+            "status": row["status"],
+            "reason": row["reason"],
+            "confidence": row["confidence"]
         }, ensure_ascii=False))
 
     dt = time.time()
@@ -742,5 +989,5 @@ if __name__ == "__main__":
     main()
 
     
-# python metric_extractor.py --year 2024 "reports/NextEra Energy Inc 2024 Sustainability Report (SustainabilityReports.com).pdf" 
+# python metric_extractor.py --year 2024 "reports/NextEra Energy Inc 2024 Sustainability Report (SustainabilityReports.com).pdf"  --test
 # remember to use environment rag-test -> conda activate rag-test
