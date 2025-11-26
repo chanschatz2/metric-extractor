@@ -28,11 +28,14 @@ TOP_K = 6                 # max total chunks to send to LLM (keep this small)
 PER_QUERY_K = 2           # chunks per query variant
 #TEMPERATURE = float(os.getenv("TEMP", "0.0"))
 MAX_NEW_TOKENS = 256#1024
-EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+#EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2" # 384 dim embedder
+EMBED_MODEL_NAME = "Alibaba-NLP/gte-large-en-v1.5" # 1024 dim embedder
+
+DEBUG = False  # global debug flag
 
 # The metrics (by id) for this LLM to extract, by grouping
 METRICS_GROUP = {
-    "Custom": [1, 2, 4, 5, 18],
+    "Custom": [4],
     "All": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35],
     "Energy&Utilities" : [1,2,3,4,5,6,7,18,19,23,24,25,27,28,29,30,31,32],
     "Manufacturing" : [1,2,3,4,5,6,7,9,11,13,15,20,21,23,24,25,27,28,29,30,33],
@@ -114,6 +117,15 @@ UNIT_TEXT_MAP = {
     "[years]": ["years", "year(s)"],
 }
 
+#
+# DEBUG
+#
+
+def log_debug(*args, **kwargs) -> None:
+    # Print only when DEBUG is True
+    if DEBUG:
+        print(*args, **kwargs)
+
 # 
 # PDF Chunking (text + table)
 # 
@@ -180,7 +192,8 @@ class Retriever:
     # Builds FAISS vector DB to hold encoded text for retrieval
     def __init__(self, chunks: List[Chunk], model_name: str = EMBED_MODEL_NAME):
         self.chunks = chunks
-        self.model = SentenceTransformer(model_name)
+        self.model = SentenceTransformer(model_name, trust_remote_code=True)
+        #self.model.max_seq_length = 512 # bit safer on runtime for long chunks
         self.dim = self.model.get_sentence_embedding_dimension()
         texts = [c.text for c in chunks]
         embs = self.model.encode(texts, normalize_embeddings=True)  # cosine via IP
@@ -235,7 +248,9 @@ def build_queries(metric_name: str, target_year: int) -> list[str]:
         if s not in seen:
             out.append(s); seen.add(s)
 
-#    print("Query Variants: " + str(out))
+    log_debug(f"== QUERY VARIANTS FOR METRIC {metric_name} ==")
+    log_debug(out)
+
     return out
 
 YEAR_RE = re.compile(r"\b(?:CY|FY)?(20\d{2})\b") # pattern to match any year
@@ -297,11 +312,11 @@ def retrieve_context(ret: Retriever, metric_name: str, target_year: int, per_que
             stitched.append(c); seen.add(c)
 
     # sort by (year proximity, semantic similarity to the metric)
-    #stitched.sort(
-    #    key=lambda t: (proximity_score(t, target_year), semantic_score(metric_name, t)),
-    #    reverse=True
-    #)
-    stitched.sort(key=lambda t: proximity_score(t, target_year), reverse=True)
+    stitched.sort(
+        key=lambda t: (proximity_score(t, target_year), semantic_score(metric_name, t)),
+        reverse=True
+    )
+    #stitched.sort(key=lambda t: proximity_score(t, target_year), reverse=True)
 
     return stitched[:total_cap]
 
@@ -335,7 +350,7 @@ class StopOnFirstJSON(StoppingCriteria):
             elif ch == '}':
                 if saw_open:
                     depth -= 1
-                    if depth == 0:   # first object closed -> stop now
+                    if depth == 0: # first object closed -> stop now
                         return True
         return False
 
@@ -443,7 +458,7 @@ def enforce_schema(obj: Dict[str, Any]) -> Dict[str, Any]:
         validate(instance=obj, schema=metric_schema())
         return obj
     except Exception as e:
-        print("VALIDATION ERROR:", e)
+        log_debug("VALIDATION ERROR:", e)
 
         # use .get to protect from weird input
         metric_id = obj.get("metric_id")
@@ -452,6 +467,11 @@ def enforce_schema(obj: Dict[str, Any]) -> Dict[str, Any]:
         unit = obj.get("unit")
         reported_year = obj.get("reported_year")
 
+        if DEBUG:
+            reason = f"schema_validation_failed: {e}"
+        else:
+            reason = "schema_validation_failed"
+
         out = {
             "metric_id": metric_id,
             "metric_name": metric_name,
@@ -459,9 +479,11 @@ def enforce_schema(obj: Dict[str, Any]) -> Dict[str, Any]:
             "unit": None if unit is None else unit,
             "reported_year": None if reported_year is None else reported_year,
             "status": "parse_error",
-            "reason": f"schema_validation_failed: {e}",
+            "reason": reason,
         }
         return out
+    
+#
 # Unit normalization
 # 
 
@@ -487,10 +509,6 @@ def normalize(value, unit):
 # Extractor pipeline using local Qwen 
 # 
 
-#     return f"""
-#Extract exactly one numeric metric as JSON for the requested metric, using ONLY the explicit information in the context.
-#Only return a value if it is explicitly labeled for the year {target_year}. If multiple years are present, choose the cell/column for the year {target_year}.
-#"If the requested year {target_year} is not explicitly present, return an empty JSON object."
 
 def build_user_prompt(metric_id: int, metric_name: str, context: str, target_year: int) -> str:
     safe_context = context.replace("```", "'") # make sure string doesnt break
@@ -566,27 +584,28 @@ def extract_metric(model: LocalQwen, metric_id: int, metric_name: str, ctx_chunk
     )
     user = build_user_prompt(metric_id, metric_name, context, target_year)
     raw = "{" + model.chat(system, user) # reattach opening brace
-    #raw = model.chat(system, user)
 
-    print("-- PASS 1: RAW --")
-    print(raw)
+    log_debug("-- PASS 1: RAW --")
+    log_debug(raw)
 
     # obj = extract_first_json(raw)
     obj = extract_last_json(raw)
     obj = enforce_schema(obj)
 
-    # avoid not passing checks later bc of metric_id metric_name
+    # avoid not passing checks later because of metric_id metric_name
     obj.setdefault("metric_id", metric_id)
     obj.setdefault("metric_name", metric_name)
 
-    print("-- PASS 1: EXTRACTED METRIC --")
-    print(obj)
+    log_debug("-- PASS 1: EXTRACTED METRIC --")
+    log_debug(obj)
     return obj
 
 def chunk_contains_value(chunk: str, v_str: str) -> bool:
+    # tolerances
     rel_tol = 1e-6
     abs_tol = 1e-6
-    # v_str -> metric value
+
+    # v_str -> metric value to find
 
     if v_str is None:
         return False
@@ -608,9 +627,18 @@ def chunk_contains_value(chunk: str, v_str: str) -> bool:
             val = float(n.replace(",", ""))
         except ValueError:
             continue
-        # numeric comparison with tolerance
+
+        # direct numeric match
         if math.isclose(val, target, rel_tol=rel_tol, abs_tol=abs_tol):
             return True
+
+        # allow simple powers of 10 scaling (thousand / million)
+        if target != 0:
+            ratio = val / target
+            # e.g., 7,900,212 vs 7,900,212,000 or 95.6 vs 95,600,000
+            for factor in (1e3, 1e6, 1e-3, 1e-6):
+                if math.isclose(ratio, factor, rel_tol=1e-2):
+                    return True
 
     return False
 
@@ -643,16 +671,16 @@ def verify_metric(model: LocalQwen, prediction: dict, chunk_text: str, metric_na
     )
 
     raw = model.chat(system=system, user=user)
-    print("-- PASS 2: CONTEXT --")
-    print(chunk_text)
-    print("-- PASS 2 VERIFY RAW --")
-    print(raw)
+    log_debug("-- PASS 2: CONTEXT --")
+    log_debug(chunk_text)
+    log_debug("-- PASS 2 VERIFY RAW --")
+    log_debug(raw)
 
     # Extract the last JSON object from the raw string
     j = extract_last_json(raw) or {}
     raw_verdict = j.get("verified", False)
 
-    # Coerce to proper bool
+    # Ensure is proper bool
     if isinstance(raw_verdict, str):
         verdict = raw_verdict.strip().lower() == "true"
     else:
@@ -691,12 +719,12 @@ def test_values(pdf_path: str, predictions: List[Dict[str, Any]]) -> None:
         print(f"[TEST] No overlapping metric_ids between TRUE_METRICS and EXTRACT_METRICS for {file_name}")
         return
 
-    retrieval_hits = 0           # TRUE value appears in any chunks_used
-    llm_exact = 0                # predicted value == TRUE value (normalized, year-aware)
+    retrieval_hits = 0 # TRUE value appears in any chunks_used
+    llm_exact = 0 # predicted value == TRUE value (normalized, year-aware)
     llm_exact_given_retrieval = 0
 
-    task_correct = 0             # your 4/5 notion: 1 correct extraction + 3 correct denials
-    value_cases = 0              # how many metrics have a non-None true value
+    task_correct = 0 # correct extractions + correct denials
+    value_cases = 0 # how many metrics have a non-None true value
     value_correct = 0
 
     print("\n=== PER-METRIC EVAL (retrieval vs extraction) ===")
@@ -716,7 +744,7 @@ def test_values(pdf_path: str, predictions: List[Dict[str, Any]]) -> None:
         status = p.get("status")
         chunks_used = p.get("chunks_used") or []
 
-        # --- 1) Retrieval recall: does ANY chunk_used contain the TRUE value? ---
+        # Retrieval recall: does ANY chunk_used contain the TRUE value?
         retrieval_hit = False
         if gt_val is not None:
             v_str = str(gt_val)
@@ -728,7 +756,7 @@ def test_values(pdf_path: str, predictions: List[Dict[str, Any]]) -> None:
         if retrieval_hit:
             retrieval_hits += 1
 
-        # --- 2) LLM extraction accuracy (numeric + year) ---
+        # LLM extraction accuracy (numeric + year)
         year_match = (gt_year is None) or (gt_year == pred_year)
 
         numeric_match = False
@@ -750,18 +778,12 @@ def test_values(pdf_path: str, predictions: List[Dict[str, Any]]) -> None:
             if retrieval_hit:
                 llm_exact_given_retrieval += 1
 
-        # --- 3) Task-level correctness (your 4/5 notion) ---
-        # If TRUE value exists: correct if we got the right number (regardless of status).
-        # If TRUE value is None: correct if we did NOT "accept" a value.
-        #
-        # Here, "accepting" a value means status == "accepted" AND pred_val is not None.
+        # "accepting" value -> status == "accepted" AND pred_val is not None.
         accepted = (status == "accepted" and pred_val is not None)
 
         if gt_val is None:
-            # desired behavior: do NOT accept when the metric truly doesn't exist
             this_correct = not accepted
         else:
-            # desired behavior: get the right value (even if status is unverified)
             this_correct = exact_match
 
         if this_correct:
@@ -795,7 +817,6 @@ def test_values(pdf_path: str, predictions: List[Dict[str, Any]]) -> None:
             "(TRUE value appears in any chunks_used): N/A (no metrics with TRUE numeric value)"
         )
 
-    # LLM exact-match accuracy: also only over metrics with TRUE numeric value
     if value_cases:
         print(
             "LLM exact-match accuracy "
@@ -821,7 +842,6 @@ def test_values(pdf_path: str, predictions: List[Dict[str, Any]]) -> None:
             "(no cases where TRUE value appeared in chunks_used)"
         )
 
-    # This one you already had, but we keep it for clarity
     if value_cases:
         print(
             f"\nValue accuracy on metrics with a TRUE numeric value: "
@@ -845,55 +865,92 @@ def test_values(pdf_path: str, predictions: List[Dict[str, Any]]) -> None:
 # 
 
 def main():
+    global DEBUG
+
     ap = argparse.ArgumentParser()
     ap.add_argument("pdf", help="Path to sustainability report PDF")
     ap.add_argument("--year", type=int, required=True, help="Target reporting year")
     ap.add_argument("--test", action="store_true", help="Evaluate predictions against truths")
+    ap.add_argument("--debug", action="store_true", help="Print detailed debug logs (raw LLM outputs, schema errors, etc.)")
     args = ap.parse_args()
 
+    DEBUG = args.debug
+
+    if not DEBUG:
+        try:
+            from transformers import logging as hf_logging
+            hf_logging.set_verbosity_error()
+        except Exception:
+            pass
+
+    # global pipeline timer
+    pipeline_start = time.time()
+
     print(f"Loading PDF and building chunks from: {args.pdf}")
+    t_pdf0 = time.time()
     chunks = extract_chunks(args.pdf, chunk_size=CHUNK_SIZE)
+    pdf_build_dt = time.time() - t_pdf0
     print(f"Total chunks: {len(chunks)}")
+    print(f"[TIMING] PDF to chunks: {pdf_build_dt:.3f} s")
 
     target_year = args.year
 
     print(f"\nLoading embeddings: {EMBED_MODEL_NAME}")
+    t_emb0 = time.time()
     retriever = Retriever(chunks, model_name=EMBED_MODEL_NAME)
+    emb_build_dt = time.time() - t_emb0
     print("FAISS index built.")
+    print(f"[TIMING] Embeddings + FAISS index: {emb_build_dt:.3f} s")
 
     print(f"\nLoading local model: {MODEL_ID}")
+    t_llm0 = time.time()
     qwen = LocalQwen(MODEL_ID)
+    llm_load_dt = time.time() - t_llm0
+    print(f"[TIMING] Local model load: {llm_load_dt:.3f} s")
 
     results = []
     extract_targets = [TARGETS[i - 1] for i in EXTRACT_METRICS]
 
-    total_time = time.time()
+    # Lists for per-metric timing
+    metric_latencies = [] # full pipeline per metric (retrieval + passes)
+    retrieval_latencies = [] # retrieval-only per metric
+
     for metric_id, metric_name in extract_targets:
         print(f"\n=== Extracting: {metric_name} (ID {metric_id}) ===")
+        metric_start = time.time()
+        t_ret0 = time.time()
+
         ctx_chunks = retrieve_context(retriever, metric_name, target_year, per_query_k=PER_QUERY_K, total_cap=TOP_K)
+        
+        retrieval_dt = time.time() - t_ret0
+        retrieval_latencies.append(retrieval_dt)
+        
         if not ctx_chunks:
             print("No context retrieved; skipping.")
+            metric_dt = time.time() - metric_start
+            metric_latencies.append(metric_dt)
             continue
 
-#        print("-- CONTEXT CHUNKS --")
-#        print(ctx_chunks)
-
         # Query LLM / Begin pipeline
-        t0 = time.time()
+
         # extract prediction json
         out = extract_metric(qwen, metric_id, metric_name, ctx_chunks, target_year) or {}
 
         # If Pass 1 failed to produce a valid JSON metric, skip verification
         if out.get("status") == "parse_error" and out.get("value") is None:
             print(f"[SKIP VERIFY] parse_error for metric {metric_id} - {metric_name}")
-            # You still want to record this attempt
+
+            metric_dt = time.time() - metric_start
+            metric_latencies.append(metric_dt)
+
+            # still want to record this attempt
             row = {
                 "metric_id": metric_id,
                 "metric_name": metric_name,
                 "value": None,
                 "unit": None,
                 "reported_year": target_year,
-                "latency_s": round(dt, 3),
+                "latency_s": round(metric_dt, 3),
                 "chunks_used": ctx_chunks,
                 "status": out.get("status"),
                 "reason": out.get("reason"),
@@ -906,8 +963,8 @@ def main():
 
         # find chunks that contain the metric
         best_chunks = find_chunks_with_value(ctx_chunks, str(out["value"]))
-        print("-- BEST CHUNKS (verifying with these) --")
-        print(best_chunks)
+        log_debug("-- BEST CHUNKS (verifying with these) --")
+        log_debug(best_chunks)
 
         # verify with second qweb call
         hits = len(best_chunks)
@@ -915,17 +972,15 @@ def main():
 
         verdict = False
         why = "not_supported_by_context"
-        supporting_chunk = None
 
         if best_chunks:
             for chk in best_chunks[:3]:  # try up to 3 strongest literal matches
                 v, w = verify_metric(qwen, out, chk, metric_name, target_year)
                 if v:
                     verdict, why = True, "supported_and_verified"
-                    supporting_chunk = chk
                     break
         else:
-            # no literal match in context → immediate rejection
+            # no literal match in context -> immediate rejection
             verdict, why = False, "not_supported_by_context"
 
         print(f"Verdict: {verdict}")
@@ -939,7 +994,10 @@ def main():
         else:
             out["status"] = "accepted"
             out["reason"] = why
-        dt = time.time() - t0 # time for both queries
+
+        metric_dt = time.time() - metric_start
+        metric_latencies.append(metric_dt)
+        print(f"[TIMING] Full pipeline for metric {metric_id}: {metric_dt:.3f} s")
 
         value = out.get("value")
         unit = out.get("unit")
@@ -953,7 +1011,7 @@ def main():
             "value": value_norm,
             "unit": unit,
             "reported_year": target_year,
-            "latency_s": round(dt, 3),
+            "latency_s": round(metric_dt, 3),
             "chunks_used": ctx_chunks,
             "status": out.get("status"),
             "reason": out.get("reason"),
@@ -961,7 +1019,7 @@ def main():
         }
         results.append(row)
 
-        print(json.dumps({
+        log_debug(json.dumps({
             "metric": metric_name,
             "value": value,
             "unit": unit,
@@ -973,8 +1031,16 @@ def main():
             "confidence": row["confidence"]
         }, ensure_ascii=False))
 
-    dt = time.time()
-    print(f"-- TOTAL LATENCY/TIME: {round(dt-total_time, 3)} --")
+    # --- SUMMARY TIMING ---
+    pipeline_dt = time.time() - pipeline_start
+    print(f"\n-- TOTAL PIPELINE TIME: {pipeline_dt:.3f} s --")
+
+    if metric_latencies:
+        avg_metric = sum(metric_latencies) / len(metric_latencies)
+        print(f"[TIMING] Avg full-metric latency: {avg_metric:.3f} s over {len(metric_latencies)} metrics")
+    if retrieval_latencies:
+        avg_retr = sum(retrieval_latencies) / len(retrieval_latencies)
+        print(f"[TIMING] Avg retrieval latency: {avg_retr:.3f} s over {len(retrieval_latencies)} metrics")
 
     if args.test: 
         test_values(args.pdf, predictions=results)
@@ -988,6 +1054,7 @@ def main():
 if __name__ == "__main__":
     main()
 
-    
+
 # python metric_extractor.py --year 2024 "reports/NextEra Energy Inc 2024 Sustainability Report (SustainabilityReports.com).pdf"  --test
+# python metric_extractor.py --year 2023 "reports/nestle_report_2023.pdf" --test
 # remember to use environment rag-test -> conda activate rag-test

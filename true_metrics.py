@@ -56,8 +56,8 @@ TRUE_METRICS = {
     {"metric_id": 23, "metric_name": "Total direct GHG emissions [tCO2e]", "value": 3160000, "unit": "tCO2e", "reported_year": 2023, "status": "ok"},
     # “Gross market-based indirect (Scope 2) GHG emissions (CO2e)”, 0.31 million tonnes in 2023
     {"metric_id": 24, "metric_name": "Total indirect GHG emissions [tCO2e]", "value": 310000, "unit": "tCO2e", "reported_year": 2023, "status": "ok"},
-    # sum of Scope 1 + Scope 2
-    {"metric_id": 25, "metric_name": "Total GHG emissions (Direct + Indirect) [tCO2e]", "value": 3470000, "unit": "tCO2e", "reported_year": 2023, "status": "manual_calculation_scope_1+2"},
+    # sum of Scope 1 + Scope 2 -> 3470000, not including
+    {"metric_id": 25, "metric_name": "Total GHG emissions (Direct + Indirect) [tCO2e]", "value": None, "unit": "tCO2e", "reported_year": None, "status": "not_found_in_report"},
     # “CO2e removals delivered for the reporting year” row, 0.76 million t
     {"metric_id": 27, "metric_name": "Emissions neutralized by Carbon Offset Projects [tCO2e]", "value": 760000, "unit": "tCO2e", "reported_year": 2023, "status": "ok"},
     {"metric_id": 28, "metric_name": "Emissions of ozone-depleting substances (ODS) [metric tons of CFC-11]", "value": None, "unit": "metric tons of CFC-11", "reported_year": None, "status": "not_found_in_report"},
